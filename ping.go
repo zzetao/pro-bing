@@ -644,6 +644,11 @@ func (p *Pinger) recvICMP(
 		offset = 20
 	}
 
+	// wsarecvfrom: A message sent on a datagram socket was larger than the internal message buffer or some other network limit, or the buffer used to receive a datagram into was smaller than the datagram itself.
+	if p.ipv4 && runtime.GOOS == "windows" && p.Privileged() {
+		offset = 20
+	}
+
 	for {
 		select {
 		case <-p.done:
