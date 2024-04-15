@@ -78,6 +78,10 @@ const (
 	trackerLength    = len(uuid.UUID{})
 	protocolICMP     = 1
 	protocolIPv6ICMP = 58
+
+	networkIP   = "ip"
+	networkIPv4 = "ip4"
+	networkIPv6 = "ip6"
 )
 
 var (
@@ -107,7 +111,7 @@ func New(addr string) *Pinger {
 		trackerUUIDs:      []uuid.UUID{firstUUID},
 		ipaddr:            nil,
 		ipv4:              false,
-		network:           "ip",
+		network:           networkIP,
 		protocol:          "udp",
 		awaitingSequences: firstSequence,
 		TTL:               64,
@@ -129,6 +133,9 @@ type Pinger struct {
 	// Timeout specifies a timeout before ping exits, regardless of how many
 	// packets have been received.
 	Timeout time.Duration
+
+	// ResolveTimeout specifies a timeout to resolve an IP address or domain name
+	ResolveTimeout time.Duration
 
 	// Count tells pinger to stop after sending (and receiving) Count echo
 	// packets. If this option is not specified, pinger will operate until
@@ -227,6 +234,7 @@ type packet struct {
 	bytes  []byte
 	nbytes int
 	ttl    int
+	addr   net.Addr
 }
 
 // Packet represents a received and processed ICMP echo packet.
@@ -337,9 +345,42 @@ func (p *Pinger) Resolve() error {
 	if len(p.addr) == 0 {
 		return errors.New("addr cannot be empty")
 	}
-	ipaddr, err := net.ResolveIPAddr(p.network, p.addr)
-	if err != nil {
-		return err
+	var (
+		ipaddr *net.IPAddr
+		err    error
+	)
+	if p.ResolveTimeout > time.Duration(0) {
+		var (
+			ctx = context.Background()
+			ips []net.IP
+		)
+		ctx, cancel := context.WithTimeout(ctx, p.ResolveTimeout)
+		defer cancel()
+		ips, err = net.DefaultResolver.LookupIP(ctx, p.network, p.addr)
+		if err != nil {
+			return err
+		}
+		if len(ips) == 0 {
+			return fmt.Errorf("lookup %s failed: no addresses found", p.addr)
+		}
+		ipaddr = &net.IPAddr{IP: ips[0]}
+		for _, ip := range ips {
+			if p.network == networkIPv6 {
+				if ip.To4() == nil && ip.To16() != nil {
+					ipaddr = &net.IPAddr{IP: ip}
+					break
+				}
+				continue
+			}
+			if ip.To4() != nil {
+				ipaddr = &net.IPAddr{IP: ip}
+			}
+		}
+	} else {
+		ipaddr, err = net.ResolveIPAddr(p.network, p.addr)
+		if err != nil {
+			return err
+		}
 	}
 
 	p.ipv4 = isIPv4(ipaddr.IP)
@@ -373,12 +414,12 @@ func (p *Pinger) Addr() string {
 // * "ip6" will select IPv6.
 func (p *Pinger) SetNetwork(n string) {
 	switch n {
-	case "ip4":
-		p.network = "ip4"
-	case "ip6":
-		p.network = "ip6"
+	case networkIPv4:
+		p.network = networkIPv4
+	case networkIPv6:
+		p.network = networkIPv6
 	default:
-		p.network = "ip"
+		p.network = networkIP
 	}
 }
 
@@ -658,9 +699,7 @@ func (p *Pinger) recvICMP(
 			if err := conn.SetReadDeadline(time.Now().Add(delay)); err != nil {
 				return err
 			}
-			var n, ttl int
-			var err error
-			n, ttl, _, err = conn.ReadFrom(bytes)
+			n, ttl, addr, err := conn.ReadFrom(bytes)
 			if err != nil {
 				if p.OnRecvError != nil {
 					p.OnRecvError(err)
@@ -678,7 +717,7 @@ func (p *Pinger) recvICMP(
 			select {
 			case <-p.done:
 				return nil
-			case recv <- &packet{bytes: bytes, nbytes: n, ttl: ttl}:
+			case recv <- &packet{bytes: bytes, nbytes: n, ttl: ttl, addr: addr}:
 			}
 		}
 	}
@@ -727,10 +766,24 @@ func (p *Pinger) processPacket(recv *packet) error {
 		return nil
 	}
 
+	// If initial ip is a broadcast ip, ping responses will come from machines' in the
+	// subnet, thus ip will differ. Below gets real ip from received package.
+	var realIP *net.IPAddr
+
+	switch v := recv.addr.(type) {
+	case *net.IPAddr: // For ICMP
+		realIP = v
+	case *net.UDPAddr:
+		realIP = &net.IPAddr{IP: v.IP}
+	default:
+		p.logger.Infof("received address: %s it neither an Ip address (ICMP) nor UDP address, shouldn't happen. using initial address", recv.addr)
+		realIP = p.ipaddr
+	}
+
 	inPkt := &Packet{
 		Nbytes: recv.nbytes,
-		IPAddr: p.ipaddr,
-		Addr:   p.addr,
+		IPAddr: realIP,
+		Addr:   realIP.String(),
 		TTL:    recv.ttl,
 		ID:     p.id,
 	}
@@ -812,6 +865,14 @@ func (p *Pinger) sendICMP(conn packetConn) error {
 
 	for {
 		if _, err := conn.WriteTo(msgBytes, dst); err != nil {
+			// Try to set broadcast flag
+			if errors.Is(err, syscall.EACCES) && runtime.GOOS == "linux" {
+				if e := conn.SetBroadcastFlag(); e != nil {
+					p.logger.Warnf("had EACCES syscall error, check your local firewall")
+				}
+				p.logger.Infof("Pinging a broadcast address")
+				continue
+			}
 			if p.OnSendError != nil {
 				outPkt := &Packet{
 					Nbytes: len(msgBytes),
